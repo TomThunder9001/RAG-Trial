@@ -1,0 +1,271 @@
+from __future__ import annotations as _annotations
+
+import asyncio
+import re
+import sys
+import unicodedata
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
+from taskgroup import run, TaskGroup, timeout
+
+import asyncpg
+import httpx
+import logfire
+import pydantic_core
+from openai import AsyncOpenAI
+from pydantic import TypeAdapter
+from typing_extensions import AsyncGenerator
+from pydantic_ai.models.openai import OpenAIModel
+from pydantic_ai.providers.openai import OpenAIProvider
+
+from pydantic_ai import RunContext
+from pydantic_ai.agent import Agent
+
+import ollama
+from ollama import AsyncClient
+
+
+# Create a function that makes a string URL friendly
+def slugify(value: str, separator: str, unicode: bool = False) -> str:
+    """Slugify a string, to make it URL friendly."""
+    # Taken unchanged from https://github.com/Python-Markdown/markdown/blob/3.7/markdown/extensions/toc.py#L38
+    if not unicode:
+        # Replace Extended Latin characters with ASCII, i.e. `žlutý` => `zluty`
+        value = unicodedata.normalize('NFKD', value)
+        value = value.encode('ascii', 'ignore').decode('ascii')
+    value = re.sub(r'[^\w\s-]', '', value).strip().lower()
+    return re.sub(rf'[{separator}\s]+', separator, value)
+
+# Define a data class DcosSection, which contains the attributes that will appear in each section of the json file
+# Define method url for the data class that will return a valid url based on the content of each section
+# Define method embedding_content for the data class, that will create the content target for embedding in each section
+
+@dataclass
+class DocsSection:
+    id: int
+    parent: int | None
+    path: str
+    level: int
+    title: str
+    content: str
+
+    def url(self) -> str:
+        url_path = re.sub(r'\.md$', '', self.path)
+        return (
+            f'https://logfire.pydantic.dev/docs/{url_path}/#{slugify(self.title, "-")}'
+        )
+
+    def embedding_content(self) -> str:
+        return '\n\n'.join((f'path: {self.path}', f'title: {self.title}', self.content))
+
+# Defines sessions_ta as an instance of the TypeAdapter class, which exposes method validate_json that first converts data into json,
+# Then parses json data based on the definition inside the TypeAdapter()
+sessions_ta = TypeAdapter(list[DocsSection])
+
+# JSON document from
+# https://gist.github.com/samuelcolvin/4b5bb9bb163b1122ff17e29e48c10992
+DOCS_JSON = (
+    'https://gist.githubusercontent.com/'
+    'samuelcolvin/4b5bb9bb163b1122ff17e29e48c10992/raw/'
+    '80c5925c42f1442c24963aaf5eb1a324d47afe95/logfire_docs.json'
+)
+
+async def build_search_db():
+    """Build the search database."""
+    async with httpx.AsyncClient() as client:
+        # Make async request to fetch the JSON document
+        response = await client.get(DOCS_JSON)
+        # Check if the response was generated successfully, it will raise an exception if the response code is not 200 (OK)
+        response.raise_for_status()
+    # In this part, sessions_ta will be defined later as TypeAdapter(list[DocSecion])
+    # The validate_json method will validate a JSON string or bytes against the model
+    # This is also a built-in JSON parsing method from Pydantic
+    sections = sessions_ta.validate_json(response.content)
+
+    # openai = AsyncOpenAI()
+    # logfire.instrument_openai(openai)
+
+    async with database_connect(True) as pool:
+        with logfire.span('create schema'):
+            async with pool.acquire() as conn:
+                async with conn.transaction():
+                    await conn.execute(DB_SCHEMA)
+
+        sem = asyncio.Semaphore(10)
+        async with TaskGroup() as tg:
+            for section in sections:
+                tg.create_task(insert_doc_section(sem, pool, section))
+
+async def insert_doc_section(
+        sem: asyncio.Semaphore,
+        # openai: AsyncOpenAI,
+        pool: asyncpg.Pool,
+        section: DocsSection,
+) -> None:
+    async with sem:
+        url = section.url()
+        # Check if the section already exists in the database
+        # While waiting for the returning result from database, let other coroutine tasks run
+        exists = await pool.fetchval('SELECT 1 FROM doc_sections WHERE url = $1', url)
+        if exists:
+            logfire.info('Skipping {url=}', url=url)
+            return
+
+        # Use logfire.span to show the execution log of creating embedding for each doc
+        with logfire.span('create embedding for {url=}', url = url):
+            embedding_response = await AsyncClient().embed(
+                input=section.embedding_content(),
+                model="mxbai-embed-large",
+            )
+
+        assert len(embedding_response.embeddings) == 1, (
+            f'Expected 1 embedding, got {len(embedding_response.embeddings)}, doc section: {section}'
+        )
+        embedding = embedding_response.embeddings[0]
+        embedding_json = pydantic_core.to_json(embedding).decode()
+        await pool.execute(
+            'INSERT INTO doc_sections (url, title, content, embedding) VALUES ($1, $2, $3, $4)',
+            url,
+            section.title,
+            section.content,
+            embedding_json,
+        )
+
+# Create a table
+@asynccontextmanager
+async def database_connect(
+        create_db: bool = False,
+) -> AsyncGenerator[asyncpg.Pool, None]:
+    # server_dsn, database = (
+    #     'postgresql://postgres:postgres@localhost:54320',
+    #     'pydantic_ai_rag',
+    # )
+    database, user, host, port, password = (
+        'postgres',
+        'postgres',
+        'localhost',
+        5432,
+        'postgres',
+    )
+    if create_db:
+        with logfire.span('check and create DB'):
+            conn = await asyncpg.connect(database=database, user=user, host=host, port=port, password=password)
+            try:
+                db_exists = await conn.fetchval(
+                    'SELECT 1 FROM items;'
+                )
+                if not db_exists:
+                    await conn.execute(f'CREATE DATABASE {database}')
+            finally:
+                await conn.close()
+
+    pool = await asyncpg.create_pool(database=database, user=user, host=host, port=port, password=password)
+    try:
+        yield pool
+    finally:
+        await pool.close()
+
+DB_SCHEMA = """
+CREATE EXTENSION IF NOT EXISTS vector;
+
+CREATE TABLE IF NOT EXISTS doc_sections (
+    id serial PRIMARY KEY,
+    url text NOT NULL UNIQUE,
+    title text NOT NULL,
+    content text NOT NULL,
+    -- text-embedding-3-small produces a vector of 1536 floats
+    embedding vector(1024) NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_doc_sections_embedding ON doc_sections USING hnsw (embedding vector_l2_ops);
+"""
+
+# 'if-token-present' means nothing will be sent (and the example will work) if you don't have logfire configured
+logfire.configure(send_to_logfire='if-token-present')
+logfire.instrument_asyncpg()
+logfire.instrument_pydantic_ai()
+
+@dataclass
+class Deps:
+    # openai: AsyncOpenAI
+    pool: asyncpg.Pool
+
+ollama_model = OpenAIModel(
+    model_name = "llama3.2", provider=OpenAIProvider(base_url="http://localhost:11434/v1")
+)
+
+agent = Agent(
+    model = ollama_model,
+    deps_type = Deps,
+    system_prompt = ("Please only use the provided documentation to answer the user's question."
+                     "If there is no relevant information in the documentation,"
+                     "Please respond with 'There is no relevant info in the documentation.'."),
+)
+
+@agent.tool
+async def retrieve(context: RunContext[Deps], search_query: str) -> str:
+    """
+    Retrieve documentation sections based on a search query.
+
+    Args:
+    context: The call context
+    search_query: The search query
+    """
+    with logfire.span(
+        'create embedding for {search_query=}', search_query = search_query
+    ):
+        embedding_response = await AsyncClient().embed(
+        input=search_query,
+        model="mxbai-embed-large",
+    )
+        # embedding = await context.deps.openai.embeddings.create(
+        #     input=search_query,
+        #     model='text-embedding-3-small',
+        # )
+
+    assert len(embedding_response.embeddings) == 1, (
+        # search_query!r is equivalent to repr(search_query), and it returns a representative string (usually all the attributes) defined by the method __repr__ of the class of an object
+        f'Expected 1 embedding, got {len(embedding_response.embeddings)}, doc query: {search_query!r}'
+    )
+    embedding = embedding_response.embeddings[0]
+    embedding_json = pydantic_core.to_json(embedding).decode()
+    rows = await context.deps.pool.fetch(
+        'SELECT url, title, content FROM doc_sections ORDER BY embedding <-> $1 LIMIT 8',
+        embedding_json,
+    )
+    return '\n\n'.join(
+        f'# {row["title"]} \nDocumentation URL:{row["url"]}\n\n{row["content"]}\n'
+        for row in rows
+    )
+
+async def run_agent(question: str) :
+    """Entry point to run the agent and perform RAG based question answering. """
+    # openai = AsyncOpenAI()
+    # logfire.instrument_openai(openai)
+
+    logfire.info('Asking "{question}"', question=question)
+
+    async with database_connect(False) as pool:
+        deps = Deps(pool=pool)
+        answer = await agent.run(question, deps=deps)
+    print(answer.output)
+
+
+# The conditions below are defining the situations when user run the entire python script via command line (Terminal)
+# The commands would be like the following: python script.py build or python script.py search "How do I use logfire.span()?"
+# Here build or search would be sys.argv[1] and the question would be sys.argv[2]
+if __name__ == '__main__':
+    action = sys.argv[1] if len(sys.argv) > 1 else None
+    if action == 'build':
+        asyncio.run(build_search_db())
+    elif action == 'search':
+        if len(sys.argv) == 3:
+            q = sys.argv[2]
+        else:
+            q = 'How do I configure logfire to work with FastAPI?'
+        asyncio.run(run_agent(q))
+    else:
+        print(
+            'uv run --extra examples -m pydantic_ai_examples.rag build|search',
+            file=sys.stderr,
+        )
+        sys.exit(1)
